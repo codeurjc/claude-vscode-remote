@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Release a Claude Code session held by an orphaned process (e.g. the extension host
+of a VS Code window that is gone) so it can be resumed from a new window.
+
+  claude-release                 list live sessions: title, web URL if remote,
+                                 and what each is doing
+  claude-release <id|prefix|pid> stop that session's process if it is idle
+  claude-release <...> --wait    wait until it is idle, then stop it
+  claude-release <...> --force   stop it even if it is busy
+
+Stopping is SIGTERM, so the process flushes its transcript on the way out.
+
+A session that is not remote is made remote and its URL printed, because a session
+can only be followed from claude.ai once it has a Remote Control session of its own.
+That has to happen after the stop: the orphan only takes orders on its stdin, which
+belongs to the extension host. So the session is resumed headless, asked for
+Remote Control the way the VS Code extension asks, and let go again.
+"""
+import datetime
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+HOME = Path.home()
+SESSIONS = HOME / ".claude" / "sessions"
+PROJECTS = HOME / ".claude" / "projects"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def load_sessions():
+    out = []
+    for f in SESSIONS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(d.get("pid"), int) and alive(d["pid"]):
+            out.append(d)
+    return sorted(out, key=lambda d: d.get("startedAt", 0))
+
+
+def transcript(d):
+    slug = re.sub(r"[^A-Za-z0-9]", "-", d.get("cwd", ""))
+    return PROJECTS / slug / f"{d['sessionId']}.jsonl"
+
+
+def title(d):
+    """One set with /rename wins over the one Claude generates; the last of each counts."""
+    found = {}
+    try:
+        with transcript(d).open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("type") == "custom-title":
+                    found["custom"] = e.get("customTitle")
+                elif e.get("type") == "ai-title":
+                    found["ai"] = e.get("aiTitle")
+    except OSError:
+        pass
+    return found.get("custom") or found.get("ai")
+
+
+def remote_url(d):
+    """Set while Remote Control is on for the session."""
+    bridge = d.get("bridgeSessionId")
+    return f"https://claude.ai/code/{bridge}" if bridge else None
+
+
+def children(pid):
+    """Direct children other than threads: tool commands the session is running."""
+    kids = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            stat = (p / "stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            if ppid == pid:
+                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+                kids.append((int(p.name), cmd))
+        except (OSError, IndexError, ValueError):
+            continue
+    return kids
+
+
+def ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    return pids
+
+
+def ago(ms):
+    if not ms:
+        return "?"
+    s = int(time.time() - ms / 1000)
+    if s < 60:
+        return f"{s} s ago"
+    if s < 3600:
+        return f"{s // 60} min ago"
+    return f"{s // 3600} h {s % 3600 // 60} min ago"
+
+
+def when(ms):
+    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M") if ms else "?"
+
+
+def describe(d, mine):
+    t = transcript(d)
+    last = t.stat().st_mtime * 1000 if t.exists() else None
+    kids = children(d["pid"])
+    status = d.get("status", "?")
+    tag = "  <- this session" if d["pid"] in mine else ""
+    print(f"{d['pid']:>8}  {d['sessionId']}  {d.get('entrypoint', '?')}{tag}")
+    print(f"          title: {title(d) or '(untitled)'}")
+    url = remote_url(d)
+    if url:
+        print(f"          remote: {url}")
+    print(f"          started {when(d.get('startedAt'))} · {status} ({ago(d.get('statusUpdatedAt'))})"
+          f" · last written to the transcript {ago(last)}")
+    for pid, cmd in kids:
+        # Claude wraps each Bash call in a shell that sources a snapshot; show what it runs.
+        inner = children(pid)
+        if cmd.startswith("/bin/bash -c source") and inner:
+            pid, cmd = inner[0]
+        where = "in the background" if status == "idle" else "running"
+        print(f"          {where} [{pid}] {cmd[:110]}")
+
+
+def find(sessions, key):
+    hits = [d for d in sessions
+            if str(d["pid"]) == key or d["sessionId"].startswith(key)]
+    if not hits:
+        sys.exit(f"No live session matches '{key}'.")
+    if len(hits) > 1:
+        sys.exit(f"'{key}' matches {len(hits)} sessions; give more characters of the id.")
+    return hits[0]
+
+
+def is_busy(d):
+    """Mid-turn. An idle session can still own background commands; those are checked apart."""
+    return d.get("status") != "idle"
+
+
+def current(d):
+    """Re-read the session file: status changes while we wait."""
+    try:
+        return json.loads((SESSIONS / f"{d['pid']}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return d
+
+
+def binary(d):
+    """The claude that holds the session, so it is resumed by the same version."""
+    try:
+        exe = os.readlink(f"/proc/{d['pid']}/exe")
+    except OSError:
+        return "claude"
+    return exe if os.path.exists(exe) else "claude"
+
+
+def make_remote(d, exe):
+    """Resume the session headless and send it the control request the VS Code extension
+    sends for Remote Control. keep_session_on_exit keeps the remote session from being
+    archived when this process exits; its id goes into the transcript, so whoever resumes
+    the session next reattaches to the same URL. Returns the URL, or None."""
+    cmd = [exe, "--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
+           f"--resume={d['sessionId']}"]
+    with tempfile.TemporaryFile(mode="w+") as err:
+        try:
+            p = subprocess.Popen(cmd, cwd=d.get("cwd"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=err, text=True)
+        except OSError as e:
+            print(f"Could not resume it to make it remote: {e}")
+            return None
+
+        lines = queue.Queue()
+
+        def pump():
+            for line in p.stdout:
+                lines.put(line)
+            lines.put(None)
+        threading.Thread(target=pump, daemon=True).start()
+
+        def send(request_id, request):
+            p.stdin.write(json.dumps({"type": "control_request", "request_id": request_id,
+                                      "request": request}) + "\n")
+            p.stdin.flush()
+
+        url = error = None
+        connected = False
+        try:
+            send("release-init", {"subtype": "initialize"})
+            send("release-rc", {"subtype": "remote_control", "enabled": True, "keep_session_on_exit": True})
+        except OSError as e:
+            error = f"it takes no requests ({e})"
+        deadline = time.time() + 60
+        while error is None and not (url and connected) and time.time() < deadline:
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                continue
+            if line is None:
+                error = f"it exited without answering (code {p.wait()})"
+                break
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if m.get("type") == "control_response" and m.get("response", {}).get("request_id") == "release-rc":
+                r = m["response"]
+                if r.get("subtype") == "success":
+                    url = r.get("response", {}).get("session_url")
+                else:
+                    error = r.get("error") or "Remote Control refused"
+            elif m.get("type") == "system" and m.get("subtype") == "bridge_state":
+                if m.get("state") == "connected":
+                    connected = True
+                elif m.get("state") in ("failed", "policy_disabled"):
+                    error = m.get("detail") or m["state"]
+        if error is None and url is None:
+            error = "no answer in 60 s"
+
+        # Closing stdin is how the extension lets a session go: it exits on its own.
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+        if error:
+            print(f"Could not make it remote: {error}")
+            err.seek(0)
+            for line in err.read().strip().splitlines()[-5:]:
+                print(f"          {line[:160]}")
+            print("          It is still released; once resumed, /remote-control makes it remote.")
+            return None
+        if not connected:
+            print("Remote Control answered but did not connect; the URL may take a while to show the conversation.")
+        return url
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    unknown = flags - {"--wait", "--force", "--help"}
+    if unknown or "--help" in flags or len(args) > 1:
+        print(__doc__.strip())
+        sys.exit(1 if unknown or len(args) > 1 else 0)
+
+    sessions = load_sessions()
+    mine = ancestors()
+
+    if not args:
+        if not sessions:
+            print("No live Claude sessions.")
+        for d in sessions:
+            describe(d, mine)
+            print()
+        print("To release one: claude-release <id, id prefix or pid> [--wait | --force]")
+        return
+
+    d = find(sessions, args[0])
+    if d["pid"] in mine:
+        sys.exit("That is the session you are running this from; not stopping it.")
+    describe(d, mine)
+
+    if "--wait" in flags:
+        while alive(d["pid"]) and is_busy(current(d)):
+            print(f"\r  busy, waiting… {time.strftime('%H:%M:%S')}", end="", flush=True)
+            time.sleep(5)
+        print()
+        d = current(d)
+    elif is_busy(d) and "--force" not in flags:
+        sys.exit("\nIt is in the middle of a turn: stopping it interrupts what it is doing. "
+                 "Use --wait to wait for the turn to end, or --force to stop it now.")
+    kids = children(d["pid"]) if alive(d["pid"]) else []
+    if kids and "--force" not in flags:
+        sys.exit(f"\nIt is not in a turn, but it owns {len(kids)} background command(s) that would die "
+                 "with it (above). If you do not need them, --force.")
+
+    url = remote_url(current(d))
+    exe = binary(d)
+    if not alive(d["pid"]):
+        print("The process has already exited.")
+    else:
+        os.kill(d["pid"], signal.SIGTERM)
+        for _ in range(40):
+            if not alive(d["pid"]):
+                break
+            time.sleep(0.25)
+        else:
+            sys.exit(f"It did not exit within 10 s of SIGTERM. If need be: kill -9 {d['pid']}")
+        print("Stopped.")
+
+    if not url:
+        print("It was not remote; making it remote…")
+        url = make_remote(d, exe)
+        if url:
+            print(f"Remote: {url}")
+    print(f"Released. Resume it from the Claude Code panel's session history, or: claude --resume {d['sessionId']}")
+
+
+if __name__ == "__main__":
+    main()
